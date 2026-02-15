@@ -6,22 +6,15 @@ metadata:
     "openclaw":
       {
         "emoji": "📈",
-        "requires": { "bins": ["python3"] },
+        "requires": { "bins": ["uv"] },
         "install":
           [
             {
-              "id": "python-brew",
+              "id": "uv-brew",
               "kind": "brew",
-              "formula": "python",
-              "bins": ["python3"],
-              "label": "Install Python (brew)",
-            },
-            {
-              "id": "python-apt",
-              "kind": "apt",
-              "package": "python3",
-              "bins": ["python3"],
-              "label": "Install Python (apt)",
+              "formula": "uv",
+              "bins": ["uv"],
+              "label": "Install uv (brew)",
             },
           ],
       },
@@ -34,10 +27,11 @@ Get current stock prices using the `yfinance` Python library. No API key require
 
 ## Installation
 
-The script requires the `yfinance` library:
+The script uses `uv` to automatically manage dependencies via PEP 723 inline metadata:
 
 ```bash
-pip install yfinance
+# uv will automatically install dependencies when running the script
+uv run {baseDir}/scripts/get_stock_price.py MSFT
 ```
 
 ## Usage
@@ -45,16 +39,16 @@ pip install yfinance
 Get current stock price for a symbol:
 
 ```bash
-python3 {baseDir}/scripts/get_stock_price.py MSFT
+uv run {baseDir}/scripts/get_stock_price.py MSFT
 # Output: Microsoft Corporation (MSFT): USD 374.51
 ```
 
 Get price for other stocks:
 
 ```bash
-python3 {baseDir}/scripts/get_stock_price.py AAPL
-python3 {baseDir}/scripts/get_stock_price.py GOOGL
-python3 {baseDir}/scripts/get_stock_price.py TSLA
+uv run {baseDir}/scripts/get_stock_price.py AAPL
+uv run {baseDir}/scripts/get_stock_price.py GOOGL
+uv run {baseDir}/scripts/get_stock_price.py TSLA
 ```
 
 ## JSON Output
@@ -62,7 +56,7 @@ python3 {baseDir}/scripts/get_stock_price.py TSLA
 For programmatic use, add the `--json` flag:
 
 ```bash
-python3 {baseDir}/scripts/get_stock_price.py MSFT --json
+uv run {baseDir}/scripts/get_stock_price.py MSFT --json
 ```
 
 Example output:
@@ -82,7 +76,7 @@ Example output:
 If the stock symbol is invalid or data is unavailable, the script will indicate failure:
 
 ```bash
-python3 {baseDir}/scripts/get_stock_price.py INVALID
+uv run {baseDir}/scripts/get_stock_price.py INVALID
 # Output: Could not fetch price for INVALID. Symbol may not exist or market data unavailable.
 ```
 
