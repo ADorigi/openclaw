@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.8"
+# dependencies = [
+#     "yfinance>=0.2.0",
+# ]
+# ///
 """
 Fetch current stock price using yfinance library.
+
+Usage:
+    uv run get_stock_price.py MSFT
+    uv run get_stock_price.py AAPL --json
 """
 import argparse
 import sys
@@ -10,7 +20,7 @@ try:
     import yfinance as yf
 except ImportError:
     print("Error: yfinance library is not installed.", file=sys.stderr)
-    print("Install it with: pip install yfinance", file=sys.stderr)
+    print("Install it with: uv add yfinance", file=sys.stderr)
     sys.exit(2)
 
 
