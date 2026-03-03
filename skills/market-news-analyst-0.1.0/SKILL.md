@@ -597,10 +597,21 @@ Trace how news impacts flowed through markets:
 
 ```
 
-**File Naming Convention:**
-`market_news_analysis_[START_DATE]_to_[END_DATE].md`
+**Output Directory:**
+Save all reports to the `market_analysis_reports` directory inside the OpenClaw workspace directory: `~/.openclaw/workspace/market_analysis_reports/`. Create the directory if it does not already exist.
 
-Example: `market_news_analysis_2024-10-25_to_2024-11-03.md`
+**File Naming Convention:**
+`market_news_analysis_report_<from-date>_<to-date>_<current_timestamp>.md`
+
+Where:
+- `<from-date>` is the start date of the analysis period in `YYYY-MM-DD` format
+- `<to-date>` is the end date of the analysis period in `YYYY-MM-DD` format
+- `<current_timestamp>` is the UTC timestamp at the moment the report is generated in `YYYY-MM-DDTHH-MM-SS` format (colons replaced with dashes for filesystem compatibility)
+
+Example: `market_news_analysis_report_2024-10-25_2024-11-03_2024-11-03T14-32-05.md`
+
+**Full Output Path Example:**
+`~/.openclaw/workspace/market_analysis_reports/market_news_analysis_report_2024-10-25_2024-11-03_2024-11-03T14-32-05.md`
 
 **Report Quality Standards:**
 - Objective, fact-based analysis (no speculation beyond probability-weighted scenarios)
