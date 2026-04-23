@@ -1,8 +1,19 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { parseByteSize } from "../cli/parse-bytes.js";
 import type { CronConfig } from "../config/types.cron.js";
-import type { CronDeliveryStatus, CronRunStatus, CronRunTelemetry } from "./types.js";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+  normalizeStringifiedOptionalString,
+} from "../shared/string-coerce.js";
+import type {
+  CronDeliveryStatus,
+  CronDeliveryTrace,
+  CronRunStatus,
+  CronRunTelemetry,
+} from "./types.js";
 
 export type CronRunLogEntry = {
   ts: number;
@@ -14,6 +25,7 @@ export type CronRunLogEntry = {
   delivered?: boolean;
   deliveryStatus?: CronDeliveryStatus;
   deliveryError?: string;
+  delivery?: CronDeliveryTrace;
   sessionId?: string;
   sessionKey?: string;
   runAtMs?: number;
@@ -75,6 +87,10 @@ export function resolveCronRunLogPath(params: { storePath: string; jobId: string
 
 const writesByPath = new Map<string, Promise<void>>();
 
+async function setSecureFileMode(filePath: string): Promise<void> {
+  await fs.chmod(filePath, 0o600).catch(() => undefined);
+}
+
 export const DEFAULT_CRON_RUN_LOG_MAX_BYTES = 2_000_000;
 export const DEFAULT_CRON_RUN_LOG_KEEP_LINES = 2_000;
 
@@ -85,7 +101,10 @@ export function resolveCronRunLogPruneOptions(cfg?: CronConfig["runLog"]): {
   let maxBytes = DEFAULT_CRON_RUN_LOG_MAX_BYTES;
   if (cfg?.maxBytes !== undefined) {
     try {
-      maxBytes = parseByteSize(String(cfg.maxBytes).trim(), { defaultUnit: "b" });
+      const configuredMaxBytes = normalizeStringifiedOptionalString(cfg.maxBytes);
+      if (configuredMaxBytes) {
+        maxBytes = parseByteSize(configuredMaxBytes, { defaultUnit: "b" });
+      }
     } catch {
       maxBytes = DEFAULT_CRON_RUN_LOG_MAX_BYTES;
     }
@@ -123,10 +142,11 @@ async function pruneIfNeeded(filePath: string, opts: { maxBytes: number; keepLin
     .map((l) => l.trim())
     .filter(Boolean);
   const kept = lines.slice(Math.max(0, lines.length - opts.keepLines));
-  const { randomBytes } = await import("node:crypto");
   const tmp = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  await fs.writeFile(tmp, `${kept.join("\n")}\n`, "utf-8");
+  await fs.writeFile(tmp, `${kept.join("\n")}\n`, { encoding: "utf-8", mode: 0o600 });
+  await setSecureFileMode(tmp);
   await fs.rename(tmp, filePath);
+  await setSecureFileMode(filePath);
 }
 
 export async function appendCronRunLog(
@@ -139,8 +159,14 @@ export async function appendCronRunLog(
   const next = prev
     .catch(() => undefined)
     .then(async () => {
-      await fs.mkdir(path.dirname(resolved), { recursive: true });
-      await fs.appendFile(resolved, `${JSON.stringify(entry)}\n`, "utf-8");
+      const runDir = path.dirname(resolved);
+      await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
+      await fs.chmod(runDir, 0o700).catch(() => undefined);
+      await fs.appendFile(resolved, `${JSON.stringify(entry)}\n`, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+      await setSecureFileMode(resolved);
       await pruneIfNeeded(resolved, {
         maxBytes: opts?.maxBytes ?? DEFAULT_CRON_RUN_LOG_MAX_BYTES,
         keepLines: opts?.keepLines ?? DEFAULT_CRON_RUN_LOG_KEEP_LINES,
@@ -227,7 +253,7 @@ function normalizeDeliveryStatuses(opts?: {
 }
 
 function parseAllRunLogEntries(raw: string, opts?: { jobId?: string }): CronRunLogEntry[] {
-  const jobId = opts?.jobId?.trim() || undefined;
+  const jobId = normalizeOptionalString(opts?.jobId);
   if (!raw.trim()) {
     return [];
   }
@@ -299,6 +325,9 @@ function parseAllRunLogEntries(raw: string, opts?: { jobId?: string }): CronRunL
       if (typeof obj.deliveryError === "string") {
         entry.deliveryError = obj.deliveryError;
       }
+      if (obj.delivery && typeof obj.delivery === "object") {
+        entry.delivery = obj.delivery;
+      }
       if (typeof obj.sessionId === "string" && obj.sessionId.trim().length > 0) {
         entry.sessionId = obj.sessionId;
       }
@@ -335,7 +364,7 @@ function filterRunLogEntries(
     if (!opts.query) {
       return true;
     }
-    return opts.queryTextForEntry(entry).toLowerCase().includes(opts.query);
+    return normalizeLowercaseStringOrEmpty(opts.queryTextForEntry(entry)).includes(opts.query);
   });
 }
 
@@ -348,14 +377,22 @@ export async function readCronRunLogEntriesPage(
   const raw = await fs.readFile(path.resolve(filePath), "utf-8").catch(() => "");
   const statuses = normalizeRunStatuses(opts);
   const deliveryStatuses = normalizeDeliveryStatuses(opts);
-  const query = opts?.query?.trim().toLowerCase() ?? "";
+  const query = normalizeLowercaseStringOrEmpty(opts?.query);
   const sortDir: CronRunLogSortDir = opts?.sortDir === "asc" ? "asc" : "desc";
   const all = parseAllRunLogEntries(raw, { jobId: opts?.jobId });
   const filtered = filterRunLogEntries(all, {
     statuses,
     deliveryStatuses,
     query,
-    queryTextForEntry: (entry) => [entry.summary ?? "", entry.error ?? "", entry.jobId].join(" "),
+    queryTextForEntry: (entry) =>
+      [
+        entry.summary ?? "",
+        entry.error ?? "",
+        entry.jobId,
+        entry.delivery?.intended?.channel ?? "",
+        entry.delivery?.resolved?.channel ?? "",
+        ...(entry.delivery?.messageToolSentTo ?? []).map((target) => target.channel),
+      ].join(" "),
   });
   const sorted =
     sortDir === "asc"
@@ -381,7 +418,7 @@ export async function readCronRunLogEntriesPageAll(
   const limit = Math.max(1, Math.min(200, Math.floor(opts.limit ?? 50)));
   const statuses = normalizeRunStatuses(opts);
   const deliveryStatuses = normalizeDeliveryStatuses(opts);
-  const query = opts.query?.trim().toLowerCase() ?? "";
+  const query = normalizeLowercaseStringOrEmpty(opts.query);
   const sortDir: CronRunLogSortDir = opts.sortDir === "asc" ? "asc" : "desc";
   const runsDir = path.resolve(path.dirname(path.resolve(opts.storePath)), "runs");
   const files = await fs.readdir(runsDir, { withFileTypes: true }).catch(() => []);
@@ -412,7 +449,15 @@ export async function readCronRunLogEntriesPageAll(
     query,
     queryTextForEntry: (entry) => {
       const jobName = opts.jobNameById?.[entry.jobId] ?? "";
-      return [entry.summary ?? "", entry.error ?? "", entry.jobId, jobName].join(" ");
+      return [
+        entry.summary ?? "",
+        entry.error ?? "",
+        entry.jobId,
+        jobName,
+        entry.delivery?.intended?.channel ?? "",
+        entry.delivery?.resolved?.channel ?? "",
+        ...(entry.delivery?.messageToolSentTo ?? []).map((target) => target.channel),
+      ].join(" ");
     },
   });
   const sorted =

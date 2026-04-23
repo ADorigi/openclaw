@@ -1,4 +1,5 @@
 export type TuiOptions = {
+  local?: boolean;
   url?: string;
   token?: string;
   password?: string;
@@ -18,6 +19,17 @@ export type ChatEvent = {
   errorMessage?: string;
 };
 
+export type BtwEvent = {
+  kind: "btw";
+  runId?: string;
+  sessionKey?: string;
+  question: string;
+  text: string;
+  isError?: boolean;
+  seq?: number;
+  ts?: number;
+};
+
 export type AgentEvent = {
   runId: string;
   stream: string;
@@ -28,7 +40,9 @@ export type ResponseUsageMode = "on" | "off" | "tokens" | "full";
 
 export type SessionInfo = {
   thinkingLevel?: string;
+  fastMode?: boolean;
   verboseLevel?: string;
+  traceLevel?: string;
   reasoningLevel?: string;
   model?: string;
   modelProvider?: string;
@@ -48,7 +62,16 @@ export type AgentSummary = {
   name?: string;
 };
 
+export type QueuedMessageMode = "steer" | "followUp";
+
+export type QueuedMessage = {
+  runId: string;
+  text: string;
+  mode: QueuedMessageMode;
+};
+
 export type GatewayStatusSummary = {
+  runtimeVersion?: string | null;
   linkChannel?: {
     id?: string;
     label?: string;
@@ -95,6 +118,8 @@ export type TuiStateAccess = {
   currentSessionKey: string;
   currentSessionId: string | null;
   activeChatRunId: string | null;
+  pendingOptimisticUserMessage?: boolean;
+  queuedMessages?: QueuedMessage[];
   historyLoaded: boolean;
   sessionInfo: SessionInfo;
   initialSessionApplied: boolean;

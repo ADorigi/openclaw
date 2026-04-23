@@ -2,7 +2,7 @@
 summary: "Voice wake and push-to-talk modes plus routing details in the mac app"
 read_when:
   - Working on voice wake or PTT pathways
-title: "Voice Wake"
+title: "Voice wake (macOS)"
 ---
 
 # Voice Wake & Push-to-Talk

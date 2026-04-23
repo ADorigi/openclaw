@@ -1,615 +1,337 @@
-import { createInterface } from "node:readline";
-import type {
-  AcpRuntimeCapabilities,
-  AcpRuntimeDoctorReport,
-  AcpRuntime,
-  AcpRuntimeEnsureInput,
-  AcpRuntimeErrorCode,
-  AcpRuntimeEvent,
-  AcpRuntimeHandle,
-  AcpRuntimeStatus,
-  AcpRuntimeTurnInput,
-  PluginLogger,
-} from "openclaw/plugin-sdk";
-import { AcpRuntimeError } from "openclaw/plugin-sdk";
-import { type ResolvedAcpxPluginConfig } from "./config.js";
-import { checkAcpxVersion } from "./ensure.js";
 import {
-  parseJsonLines,
-  parsePromptEventLine,
-  toAcpxErrorEvent,
-} from "./runtime-internals/events.js";
-import {
-  resolveSpawnFailure,
-  type SpawnCommandCache,
-  type SpawnCommandOptions,
-  type SpawnResolutionEvent,
-  spawnAndCollect,
-  spawnWithResolvedCommand,
-  waitForExit,
-} from "./runtime-internals/process.js";
-import {
-  asOptionalString,
-  asTrimmedString,
-  buildPermissionArgs,
-  deriveAgentFromSessionKey,
-  isRecord,
-  type AcpxHandleState,
-  type AcpxJsonObject,
-} from "./runtime-internals/shared.js";
+  ACPX_BACKEND_ID,
+  AcpxRuntime as BaseAcpxRuntime,
+  createAcpRuntime,
+  createAgentRegistry,
+  createFileSessionStore,
+  decodeAcpxRuntimeHandleState,
+  encodeAcpxRuntimeHandleState,
+  type AcpAgentRegistry,
+  type AcpRuntimeDoctorReport,
+  type AcpRuntimeEvent,
+  type AcpRuntimeHandle,
+  type AcpRuntimeOptions,
+  type AcpRuntimeStatus,
+} from "acpx/runtime";
+import type { AcpRuntime } from "../runtime-api.js";
 
-export const ACPX_BACKEND_ID = "acpx";
+type AcpSessionStore = AcpRuntimeOptions["sessionStore"];
+type AcpSessionRecord = Parameters<AcpSessionStore["save"]>[0];
+type AcpLoadedSessionRecord = Awaited<ReturnType<AcpSessionStore["load"]>>;
 
-const ACPX_RUNTIME_HANDLE_PREFIX = "acpx:v1:";
-const DEFAULT_AGENT_FALLBACK = "codex";
-const ACPX_CAPABILITIES: AcpRuntimeCapabilities = {
-  controls: ["session/set_mode", "session/set_config_option", "session/status"],
+type ResetAwareSessionStore = AcpSessionStore & {
+  markFresh: (sessionKey: string) => void;
 };
 
-export function encodeAcpxRuntimeHandleState(state: AcpxHandleState): string {
-  const payload = Buffer.from(JSON.stringify(state), "utf8").toString("base64url");
-  return `${ACPX_RUNTIME_HANDLE_PREFIX}${payload}`;
+function readSessionRecordName(record: AcpSessionRecord): string {
+  if (typeof record !== "object" || record === null) {
+    return "";
+  }
+  const { name } = record as { name?: unknown };
+  return typeof name === "string" ? name.trim() : "";
 }
 
-export function decodeAcpxRuntimeHandleState(runtimeSessionName: string): AcpxHandleState | null {
-  const trimmed = runtimeSessionName.trim();
-  if (!trimmed.startsWith(ACPX_RUNTIME_HANDLE_PREFIX)) {
-    return null;
+function createResetAwareSessionStore(baseStore: AcpSessionStore): ResetAwareSessionStore {
+  const freshSessionKeys = new Set<string>();
+
+  return {
+    async load(sessionId: string): Promise<AcpLoadedSessionRecord> {
+      const normalized = sessionId.trim();
+      if (normalized && freshSessionKeys.has(normalized)) {
+        return undefined;
+      }
+      return await baseStore.load(sessionId);
+    },
+    async save(record: AcpSessionRecord): Promise<void> {
+      await baseStore.save(record);
+      const sessionName = readSessionRecordName(record);
+      if (sessionName) {
+        freshSessionKeys.delete(sessionName);
+      }
+    },
+    markFresh(sessionKey: string): void {
+      const normalized = sessionKey.trim();
+      if (normalized) {
+        freshSessionKeys.add(normalized);
+      }
+    },
+  };
+}
+
+const OPENCLAW_BRIDGE_EXECUTABLE = "openclaw";
+const OPENCLAW_BRIDGE_SUBCOMMAND = "acp";
+
+function normalizeAgentName(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized ? normalized : undefined;
+}
+
+function readAgentFromSessionKey(sessionKey: string | undefined): string | undefined {
+  const normalized = sessionKey?.trim();
+  if (!normalized) {
+    return undefined;
   }
-  const encoded = trimmed.slice(ACPX_RUNTIME_HANDLE_PREFIX.length);
-  if (!encoded) {
-    return null;
+  const match = /^agent:(?<agent>[^:]+):/i.exec(normalized);
+  return normalizeAgentName(match?.groups?.agent);
+}
+
+function readAgentFromHandle(handle: AcpRuntimeHandle): string | undefined {
+  const decoded = decodeAcpxRuntimeHandleState(handle.runtimeSessionName);
+  if (typeof decoded === "object" && decoded !== null) {
+    const { agent } = decoded as { agent?: unknown };
+    if (typeof agent === "string") {
+      return normalizeAgentName(agent) ?? readAgentFromSessionKey(handle.sessionKey);
+    }
   }
-  try {
-    const raw = Buffer.from(encoded, "base64url").toString("utf8");
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed)) {
-      return null;
-    }
-    const name = asTrimmedString(parsed.name);
-    const agent = asTrimmedString(parsed.agent);
-    const cwd = asTrimmedString(parsed.cwd);
-    const mode = asTrimmedString(parsed.mode);
-    const acpxRecordId = asOptionalString(parsed.acpxRecordId);
-    const backendSessionId = asOptionalString(parsed.backendSessionId);
-    const agentSessionId = asOptionalString(parsed.agentSessionId);
-    if (!name || !agent || !cwd) {
-      return null;
-    }
-    if (mode !== "persistent" && mode !== "oneshot") {
-      return null;
-    }
-    return {
-      name,
-      agent,
-      cwd,
-      mode,
-      ...(acpxRecordId ? { acpxRecordId } : {}),
-      ...(backendSessionId ? { backendSessionId } : {}),
-      ...(agentSessionId ? { agentSessionId } : {}),
-    };
-  } catch {
-    return null;
+  return readAgentFromSessionKey(handle.sessionKey);
+}
+
+function readAgentCommandFromRecord(record: AcpLoadedSessionRecord): string | undefined {
+  if (typeof record !== "object" || record === null) {
+    return undefined;
   }
+  const { agentCommand } = record as { agentCommand?: unknown };
+  return typeof agentCommand === "string" ? agentCommand.trim() || undefined : undefined;
+}
+
+function splitCommandParts(value: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaping = false;
+
+  for (const ch of value) {
+    if (escaping) {
+      current += ch;
+      escaping = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        parts.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+
+  if (escaping) {
+    current += "\\";
+  }
+  if (current) {
+    parts.push(current);
+  }
+  return parts;
+}
+
+function basename(value: string): string {
+  return value.split(/[\\/]/).pop() ?? value;
+}
+
+function isEnvAssignment(value: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(value);
+}
+
+function unwrapEnvCommand(parts: string[]): string[] {
+  if (!parts.length || basename(parts[0]) !== "env") {
+    return parts;
+  }
+  let index = 1;
+  while (index < parts.length && isEnvAssignment(parts[index])) {
+    index += 1;
+  }
+  return parts.slice(index);
+}
+
+function isOpenClawBridgeCommand(command: string | undefined): boolean {
+  if (!command) {
+    return false;
+  }
+  const parts = unwrapEnvCommand(splitCommandParts(command.trim()));
+  if (basename(parts[0] ?? "") === OPENCLAW_BRIDGE_EXECUTABLE) {
+    return parts[1] === OPENCLAW_BRIDGE_SUBCOMMAND;
+  }
+  if (basename(parts[0] ?? "") !== "node") {
+    return false;
+  }
+  const scriptName = basename(parts[1] ?? "");
+  return /^openclaw(?:\.[cm]?js)?$/i.test(scriptName) && parts[2] === OPENCLAW_BRIDGE_SUBCOMMAND;
+}
+
+function resolveAgentCommand(params: {
+  agentName: string | undefined;
+  agentRegistry: AcpAgentRegistry;
+}): string | undefined {
+  const normalizedAgentName = normalizeAgentName(params.agentName);
+  if (!normalizedAgentName) {
+    return undefined;
+  }
+  const resolvedCommand = params.agentRegistry.resolve(normalizedAgentName);
+  return typeof resolvedCommand === "string" ? resolvedCommand.trim() || undefined : undefined;
+}
+
+function resolveProbeAgentName(options: AcpRuntimeOptions): string {
+  const { probeAgent } = options as { probeAgent?: unknown };
+  return normalizeAgentName(typeof probeAgent === "string" ? probeAgent : undefined) ?? "codex";
+}
+
+function resolveAgentCommandForName(params: {
+  agentName: string | undefined;
+  agentRegistry: AcpAgentRegistry;
+}): string | undefined {
+  return resolveAgentCommand(params);
+}
+
+function shouldUseBridgeSafeDelegateForCommand(command: string | undefined): boolean {
+  return isOpenClawBridgeCommand(command);
+}
+
+function shouldUseDistinctBridgeDelegate(options: AcpRuntimeOptions): boolean {
+  const { mcpServers } = options as { mcpServers?: unknown };
+  return Array.isArray(mcpServers) && mcpServers.length > 0;
 }
 
 export class AcpxRuntime implements AcpRuntime {
-  private healthy = false;
-  private readonly logger?: PluginLogger;
-  private readonly queueOwnerTtlSeconds: number;
-  private readonly spawnCommandCache: SpawnCommandCache = {};
-  private readonly spawnCommandOptions: SpawnCommandOptions;
-  private readonly loggedSpawnResolutions = new Set<string>();
+  private readonly sessionStore: ResetAwareSessionStore;
+  private readonly agentRegistry: AcpAgentRegistry;
+  private readonly delegate: BaseAcpxRuntime;
+  private readonly bridgeSafeDelegate: BaseAcpxRuntime;
+  private readonly probeDelegate: BaseAcpxRuntime;
 
   constructor(
-    private readonly config: ResolvedAcpxPluginConfig,
-    opts?: {
-      logger?: PluginLogger;
-      queueOwnerTtlSeconds?: number;
-    },
+    options: AcpRuntimeOptions,
+    testOptions?: ConstructorParameters<typeof BaseAcpxRuntime>[1],
   ) {
-    this.logger = opts?.logger;
-    const requestedQueueOwnerTtlSeconds = opts?.queueOwnerTtlSeconds;
-    this.queueOwnerTtlSeconds =
-      typeof requestedQueueOwnerTtlSeconds === "number" &&
-      Number.isFinite(requestedQueueOwnerTtlSeconds) &&
-      requestedQueueOwnerTtlSeconds >= 0
-        ? requestedQueueOwnerTtlSeconds
-        : this.config.queueOwnerTtlSeconds;
-    this.spawnCommandOptions = {
-      strictWindowsCmdWrapper: this.config.strictWindowsCmdWrapper,
-      cache: this.spawnCommandCache,
-      onResolved: (event) => {
-        this.logSpawnResolution(event);
-      },
+    this.sessionStore = createResetAwareSessionStore(options.sessionStore);
+    this.agentRegistry = options.agentRegistry;
+    const sharedOptions = {
+      ...options,
+      sessionStore: this.sessionStore,
     };
+    this.delegate = new BaseAcpxRuntime(sharedOptions, testOptions);
+    this.bridgeSafeDelegate = shouldUseDistinctBridgeDelegate(options)
+      ? new BaseAcpxRuntime(
+          {
+            ...sharedOptions,
+            mcpServers: [],
+          },
+          testOptions,
+        )
+      : this.delegate;
+    this.probeDelegate = this.resolveDelegateForAgent(resolveProbeAgentName(options));
+  }
+
+  private resolveDelegateForAgent(agentName: string | undefined): BaseAcpxRuntime {
+    const command = resolveAgentCommandForName({
+      agentName,
+      agentRegistry: this.agentRegistry,
+    });
+    return this.resolveDelegateForCommand(command);
+  }
+
+  private resolveDelegateForCommand(command: string | undefined): BaseAcpxRuntime {
+    return shouldUseBridgeSafeDelegateForCommand(command) ? this.bridgeSafeDelegate : this.delegate;
+  }
+
+  private async resolveDelegateForHandle(handle: AcpRuntimeHandle): Promise<BaseAcpxRuntime> {
+    const record = await this.sessionStore.load(handle.acpxRecordId ?? handle.sessionKey);
+    const recordCommand = readAgentCommandFromRecord(record);
+    if (recordCommand) {
+      return this.resolveDelegateForCommand(recordCommand);
+    }
+    return this.resolveDelegateForAgent(readAgentFromHandle(handle));
   }
 
   isHealthy(): boolean {
-    return this.healthy;
+    return this.probeDelegate.isHealthy();
   }
 
-  private logSpawnResolution(event: SpawnResolutionEvent): void {
-    const key = `${event.command}::${event.strictWindowsCmdWrapper ? "strict" : "compat"}::${event.resolution}`;
-    if (event.cacheHit || this.loggedSpawnResolutions.has(key)) {
-      return;
-    }
-    this.loggedSpawnResolutions.add(key);
-    this.logger?.debug?.(
-      `acpx spawn resolver: command=${event.command} mode=${event.strictWindowsCmdWrapper ? "strict" : "compat"} resolution=${event.resolution}`,
-    );
+  probeAvailability(): Promise<void> {
+    return this.probeDelegate.probeAvailability();
   }
 
-  async probeAvailability(): Promise<void> {
-    const versionCheck = await checkAcpxVersion({
-      command: this.config.command,
-      cwd: this.config.cwd,
-      expectedVersion: this.config.expectedVersion,
-      spawnOptions: this.spawnCommandOptions,
+  doctor(): Promise<AcpRuntimeDoctorReport> {
+    return this.probeDelegate.doctor();
+  }
+
+  ensureSession(input: Parameters<AcpRuntime["ensureSession"]>[0]): Promise<AcpRuntimeHandle> {
+    return this.resolveDelegateForAgent(input.agent).ensureSession(input);
+  }
+
+  async *runTurn(input: Parameters<AcpRuntime["runTurn"]>[0]): AsyncIterable<AcpRuntimeEvent> {
+    yield* (await this.resolveDelegateForHandle(input.handle)).runTurn(input);
+  }
+
+  getCapabilities(): ReturnType<BaseAcpxRuntime["getCapabilities"]> {
+    return this.delegate.getCapabilities();
+  }
+
+  async getStatus(
+    input: Parameters<NonNullable<AcpRuntime["getStatus"]>>[0],
+  ): Promise<AcpRuntimeStatus> {
+    const delegate = await this.resolveDelegateForHandle(input.handle);
+    return delegate.getStatus(input);
+  }
+
+  async setMode(input: Parameters<NonNullable<AcpRuntime["setMode"]>>[0]): Promise<void> {
+    const delegate = await this.resolveDelegateForHandle(input.handle);
+    await delegate.setMode(input);
+  }
+
+  async setConfigOption(
+    input: Parameters<NonNullable<AcpRuntime["setConfigOption"]>>[0],
+  ): Promise<void> {
+    const delegate = await this.resolveDelegateForHandle(input.handle);
+    await delegate.setConfigOption(input);
+  }
+
+  async cancel(input: Parameters<AcpRuntime["cancel"]>[0]): Promise<void> {
+    const delegate = await this.resolveDelegateForHandle(input.handle);
+    await delegate.cancel(input);
+  }
+
+  async prepareFreshSession(input: { sessionKey: string }): Promise<void> {
+    this.sessionStore.markFresh(input.sessionKey);
+  }
+
+  async close(input: Parameters<AcpRuntime["close"]>[0]): Promise<void> {
+    await (
+      await this.resolveDelegateForHandle(input.handle)
+    ).close({
+      handle: input.handle,
+      reason: input.reason,
+      discardPersistentState: input.discardPersistentState,
     });
-    if (!versionCheck.ok) {
-      this.healthy = false;
-      return;
+    if (input.discardPersistentState) {
+      this.sessionStore.markFresh(input.handle.sessionKey);
     }
-
-    try {
-      const result = await spawnAndCollect(
-        {
-          command: this.config.command,
-          args: ["--help"],
-          cwd: this.config.cwd,
-        },
-        this.spawnCommandOptions,
-      );
-      this.healthy = result.error == null && (result.code ?? 0) === 0;
-    } catch {
-      this.healthy = false;
-    }
-  }
-
-  async ensureSession(input: AcpRuntimeEnsureInput): Promise<AcpRuntimeHandle> {
-    const sessionName = asTrimmedString(input.sessionKey);
-    if (!sessionName) {
-      throw new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP session key is required.");
-    }
-    const agent = asTrimmedString(input.agent);
-    if (!agent) {
-      throw new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP agent id is required.");
-    }
-    const cwd = asTrimmedString(input.cwd) || this.config.cwd;
-    const mode = input.mode;
-
-    const events = await this.runControlCommand({
-      args: this.buildControlArgs({
-        cwd,
-        command: [agent, "sessions", "ensure", "--name", sessionName],
-      }),
-      cwd,
-      fallbackCode: "ACP_SESSION_INIT_FAILED",
-    });
-    const ensuredEvent = events.find(
-      (event) =>
-        asOptionalString(event.agentSessionId) ||
-        asOptionalString(event.acpxSessionId) ||
-        asOptionalString(event.acpxRecordId),
-    );
-    const acpxRecordId = ensuredEvent ? asOptionalString(ensuredEvent.acpxRecordId) : undefined;
-    const agentSessionId = ensuredEvent ? asOptionalString(ensuredEvent.agentSessionId) : undefined;
-    const backendSessionId = ensuredEvent
-      ? asOptionalString(ensuredEvent.acpxSessionId)
-      : undefined;
-
-    return {
-      sessionKey: input.sessionKey,
-      backend: ACPX_BACKEND_ID,
-      runtimeSessionName: encodeAcpxRuntimeHandleState({
-        name: sessionName,
-        agent,
-        cwd,
-        mode,
-        ...(acpxRecordId ? { acpxRecordId } : {}),
-        ...(backendSessionId ? { backendSessionId } : {}),
-        ...(agentSessionId ? { agentSessionId } : {}),
-      }),
-      cwd,
-      ...(acpxRecordId ? { acpxRecordId } : {}),
-      ...(backendSessionId ? { backendSessionId } : {}),
-      ...(agentSessionId ? { agentSessionId } : {}),
-    };
-  }
-
-  async *runTurn(input: AcpRuntimeTurnInput): AsyncIterable<AcpRuntimeEvent> {
-    const state = this.resolveHandleState(input.handle);
-    const args = this.buildPromptArgs({
-      agent: state.agent,
-      sessionName: state.name,
-      cwd: state.cwd,
-    });
-
-    const cancelOnAbort = async () => {
-      await this.cancel({
-        handle: input.handle,
-        reason: "abort-signal",
-      }).catch((err) => {
-        this.logger?.warn?.(`acpx runtime abort-cancel failed: ${String(err)}`);
-      });
-    };
-    const onAbort = () => {
-      void cancelOnAbort();
-    };
-
-    if (input.signal?.aborted) {
-      await cancelOnAbort();
-      return;
-    }
-    if (input.signal) {
-      input.signal.addEventListener("abort", onAbort, { once: true });
-    }
-    const child = spawnWithResolvedCommand(
-      {
-        command: this.config.command,
-        args,
-        cwd: state.cwd,
-      },
-      this.spawnCommandOptions,
-    );
-    child.stdin.on("error", () => {
-      // Ignore EPIPE when the child exits before stdin flush completes.
-    });
-
-    child.stdin.end(input.text);
-
-    let stderr = "";
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-
-    let sawDone = false;
-    let sawError = false;
-    const lines = createInterface({ input: child.stdout });
-    try {
-      for await (const line of lines) {
-        const parsed = parsePromptEventLine(line);
-        if (!parsed) {
-          continue;
-        }
-        if (parsed.type === "done") {
-          if (sawDone) {
-            continue;
-          }
-          sawDone = true;
-        }
-        if (parsed.type === "error") {
-          sawError = true;
-        }
-        yield parsed;
-      }
-
-      const exit = await waitForExit(child);
-      if (exit.error) {
-        const spawnFailure = resolveSpawnFailure(exit.error, state.cwd);
-        if (spawnFailure === "missing-command") {
-          this.healthy = false;
-          throw new AcpRuntimeError(
-            "ACP_BACKEND_UNAVAILABLE",
-            `acpx command not found: ${this.config.command}`,
-            { cause: exit.error },
-          );
-        }
-        if (spawnFailure === "missing-cwd") {
-          throw new AcpRuntimeError(
-            "ACP_TURN_FAILED",
-            `ACP runtime working directory does not exist: ${state.cwd}`,
-            { cause: exit.error },
-          );
-        }
-        throw new AcpRuntimeError("ACP_TURN_FAILED", exit.error.message, { cause: exit.error });
-      }
-
-      if ((exit.code ?? 0) !== 0 && !sawError) {
-        yield {
-          type: "error",
-          message: stderr.trim() || `acpx exited with code ${exit.code ?? "unknown"}`,
-        };
-        return;
-      }
-
-      if (!sawDone && !sawError) {
-        yield { type: "done" };
-      }
-    } finally {
-      lines.close();
-      if (input.signal) {
-        input.signal.removeEventListener("abort", onAbort);
-      }
-    }
-  }
-
-  getCapabilities(): AcpRuntimeCapabilities {
-    return ACPX_CAPABILITIES;
-  }
-
-  async getStatus(input: { handle: AcpRuntimeHandle }): Promise<AcpRuntimeStatus> {
-    const state = this.resolveHandleState(input.handle);
-    const events = await this.runControlCommand({
-      args: this.buildControlArgs({
-        cwd: state.cwd,
-        command: [state.agent, "status", "--session", state.name],
-      }),
-      cwd: state.cwd,
-      fallbackCode: "ACP_TURN_FAILED",
-      ignoreNoSession: true,
-    });
-    const detail = events.find((event) => !toAcpxErrorEvent(event)) ?? events[0];
-    if (!detail) {
-      return {
-        summary: "acpx status unavailable",
-      };
-    }
-    const status = asTrimmedString(detail.status) || "unknown";
-    const acpxRecordId = asOptionalString(detail.acpxRecordId);
-    const acpxSessionId = asOptionalString(detail.acpxSessionId);
-    const agentSessionId = asOptionalString(detail.agentSessionId);
-    const pid = typeof detail.pid === "number" && Number.isFinite(detail.pid) ? detail.pid : null;
-    const summary = [
-      `status=${status}`,
-      acpxRecordId ? `acpxRecordId=${acpxRecordId}` : null,
-      acpxSessionId ? `acpxSessionId=${acpxSessionId}` : null,
-      pid != null ? `pid=${pid}` : null,
-    ]
-      .filter(Boolean)
-      .join(" ");
-    return {
-      summary,
-      ...(acpxRecordId ? { acpxRecordId } : {}),
-      ...(acpxSessionId ? { backendSessionId: acpxSessionId } : {}),
-      ...(agentSessionId ? { agentSessionId } : {}),
-      details: detail,
-    };
-  }
-
-  async setMode(input: { handle: AcpRuntimeHandle; mode: string }): Promise<void> {
-    const state = this.resolveHandleState(input.handle);
-    const mode = asTrimmedString(input.mode);
-    if (!mode) {
-      throw new AcpRuntimeError("ACP_TURN_FAILED", "ACP runtime mode is required.");
-    }
-    await this.runControlCommand({
-      args: this.buildControlArgs({
-        cwd: state.cwd,
-        command: [state.agent, "set-mode", mode, "--session", state.name],
-      }),
-      cwd: state.cwd,
-      fallbackCode: "ACP_TURN_FAILED",
-    });
-  }
-
-  async setConfigOption(input: {
-    handle: AcpRuntimeHandle;
-    key: string;
-    value: string;
-  }): Promise<void> {
-    const state = this.resolveHandleState(input.handle);
-    const key = asTrimmedString(input.key);
-    const value = asTrimmedString(input.value);
-    if (!key || !value) {
-      throw new AcpRuntimeError("ACP_TURN_FAILED", "ACP config option key/value are required.");
-    }
-    await this.runControlCommand({
-      args: this.buildControlArgs({
-        cwd: state.cwd,
-        command: [state.agent, "set", key, value, "--session", state.name],
-      }),
-      cwd: state.cwd,
-      fallbackCode: "ACP_TURN_FAILED",
-    });
-  }
-
-  async doctor(): Promise<AcpRuntimeDoctorReport> {
-    const versionCheck = await checkAcpxVersion({
-      command: this.config.command,
-      cwd: this.config.cwd,
-      expectedVersion: this.config.expectedVersion,
-      spawnOptions: this.spawnCommandOptions,
-    });
-    if (!versionCheck.ok) {
-      this.healthy = false;
-      const details = [
-        versionCheck.expectedVersion ? `expected=${versionCheck.expectedVersion}` : null,
-        versionCheck.installedVersion ? `installed=${versionCheck.installedVersion}` : null,
-      ].filter((detail): detail is string => Boolean(detail));
-      return {
-        ok: false,
-        code: "ACP_BACKEND_UNAVAILABLE",
-        message: versionCheck.message,
-        installCommand: versionCheck.installCommand,
-        details,
-      };
-    }
-
-    try {
-      const result = await spawnAndCollect(
-        {
-          command: this.config.command,
-          args: ["--help"],
-          cwd: this.config.cwd,
-        },
-        this.spawnCommandOptions,
-      );
-      if (result.error) {
-        const spawnFailure = resolveSpawnFailure(result.error, this.config.cwd);
-        if (spawnFailure === "missing-command") {
-          this.healthy = false;
-          return {
-            ok: false,
-            code: "ACP_BACKEND_UNAVAILABLE",
-            message: `acpx command not found: ${this.config.command}`,
-            installCommand: this.config.installCommand,
-          };
-        }
-        if (spawnFailure === "missing-cwd") {
-          this.healthy = false;
-          return {
-            ok: false,
-            code: "ACP_BACKEND_UNAVAILABLE",
-            message: `ACP runtime working directory does not exist: ${this.config.cwd}`,
-          };
-        }
-        this.healthy = false;
-        return {
-          ok: false,
-          code: "ACP_BACKEND_UNAVAILABLE",
-          message: result.error.message,
-          details: [String(result.error)],
-        };
-      }
-      if ((result.code ?? 0) !== 0) {
-        this.healthy = false;
-        return {
-          ok: false,
-          code: "ACP_BACKEND_UNAVAILABLE",
-          message: result.stderr.trim() || `acpx exited with code ${result.code ?? "unknown"}`,
-        };
-      }
-      this.healthy = true;
-      return {
-        ok: true,
-        message: `acpx command available (${this.config.command}, version ${versionCheck.version}${this.config.expectedVersion ? `, expected ${this.config.expectedVersion}` : ""})`,
-      };
-    } catch (error) {
-      this.healthy = false;
-      return {
-        ok: false,
-        code: "ACP_BACKEND_UNAVAILABLE",
-        message: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  async cancel(input: { handle: AcpRuntimeHandle; reason?: string }): Promise<void> {
-    const state = this.resolveHandleState(input.handle);
-    await this.runControlCommand({
-      args: this.buildControlArgs({
-        cwd: state.cwd,
-        command: [state.agent, "cancel", "--session", state.name],
-      }),
-      cwd: state.cwd,
-      fallbackCode: "ACP_TURN_FAILED",
-      ignoreNoSession: true,
-    });
-  }
-
-  async close(input: { handle: AcpRuntimeHandle; reason: string }): Promise<void> {
-    const state = this.resolveHandleState(input.handle);
-    await this.runControlCommand({
-      args: this.buildControlArgs({
-        cwd: state.cwd,
-        command: [state.agent, "sessions", "close", state.name],
-      }),
-      cwd: state.cwd,
-      fallbackCode: "ACP_TURN_FAILED",
-      ignoreNoSession: true,
-    });
-  }
-
-  private resolveHandleState(handle: AcpRuntimeHandle): AcpxHandleState {
-    const decoded = decodeAcpxRuntimeHandleState(handle.runtimeSessionName);
-    if (decoded) {
-      return decoded;
-    }
-
-    const legacyName = asTrimmedString(handle.runtimeSessionName);
-    if (!legacyName) {
-      throw new AcpRuntimeError(
-        "ACP_SESSION_INIT_FAILED",
-        "Invalid acpx runtime handle: runtimeSessionName is missing.",
-      );
-    }
-
-    return {
-      name: legacyName,
-      agent: deriveAgentFromSessionKey(handle.sessionKey, DEFAULT_AGENT_FALLBACK),
-      cwd: this.config.cwd,
-      mode: "persistent",
-    };
-  }
-
-  private buildControlArgs(params: { cwd: string; command: string[] }): string[] {
-    return ["--format", "json", "--json-strict", "--cwd", params.cwd, ...params.command];
-  }
-
-  private buildPromptArgs(params: { agent: string; sessionName: string; cwd: string }): string[] {
-    const args = [
-      "--format",
-      "json",
-      "--json-strict",
-      "--cwd",
-      params.cwd,
-      ...buildPermissionArgs(this.config.permissionMode),
-      "--non-interactive-permissions",
-      this.config.nonInteractivePermissions,
-    ];
-    if (this.config.timeoutSeconds) {
-      args.push("--timeout", String(this.config.timeoutSeconds));
-    }
-    args.push("--ttl", String(this.queueOwnerTtlSeconds));
-    args.push(params.agent, "prompt", "--session", params.sessionName, "--file", "-");
-    return args;
-  }
-
-  private async runControlCommand(params: {
-    args: string[];
-    cwd: string;
-    fallbackCode: AcpRuntimeErrorCode;
-    ignoreNoSession?: boolean;
-  }): Promise<AcpxJsonObject[]> {
-    const result = await spawnAndCollect(
-      {
-        command: this.config.command,
-        args: params.args,
-        cwd: params.cwd,
-      },
-      this.spawnCommandOptions,
-    );
-
-    if (result.error) {
-      const spawnFailure = resolveSpawnFailure(result.error, params.cwd);
-      if (spawnFailure === "missing-command") {
-        this.healthy = false;
-        throw new AcpRuntimeError(
-          "ACP_BACKEND_UNAVAILABLE",
-          `acpx command not found: ${this.config.command}`,
-          { cause: result.error },
-        );
-      }
-      if (spawnFailure === "missing-cwd") {
-        throw new AcpRuntimeError(
-          params.fallbackCode,
-          `ACP runtime working directory does not exist: ${params.cwd}`,
-          { cause: result.error },
-        );
-      }
-      throw new AcpRuntimeError(params.fallbackCode, result.error.message, { cause: result.error });
-    }
-
-    const events = parseJsonLines(result.stdout);
-    const errorEvent = events.map((event) => toAcpxErrorEvent(event)).find(Boolean) ?? null;
-    if (errorEvent) {
-      if (params.ignoreNoSession && errorEvent.code === "NO_SESSION") {
-        return events;
-      }
-      throw new AcpRuntimeError(
-        params.fallbackCode,
-        errorEvent.code ? `${errorEvent.code}: ${errorEvent.message}` : errorEvent.message,
-      );
-    }
-
-    if ((result.code ?? 0) !== 0) {
-      throw new AcpRuntimeError(
-        params.fallbackCode,
-        result.stderr.trim() || `acpx exited with code ${result.code ?? "unknown"}`,
-      );
-    }
-    return events;
   }
 }
+
+export {
+  ACPX_BACKEND_ID,
+  createAcpRuntime,
+  createAgentRegistry,
+  createFileSessionStore,
+  decodeAcpxRuntimeHandleState,
+  encodeAcpxRuntimeHandleState,
+};
+
+export type { AcpAgentRegistry, AcpRuntimeOptions, AcpSessionRecord, AcpSessionStore };

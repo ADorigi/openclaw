@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "ai.openclaw.android.benchmark"
+    namespace = "ai.openclaw.app.benchmark"
     compileSdk = 36
 
     defaultConfig {
@@ -40,6 +40,6 @@ ktlint {
 
 dependencies {
     implementation("androidx.benchmark:benchmark-macro-junit4:1.4.1")
-    implementation("androidx.test.ext:junit:1.2.1")
-    implementation("androidx.test.uiautomator:uiautomator:2.4.0-alpha06")
+    implementation("androidx.test.ext:junit:1.3.0")
+    implementation("androidx.test.uiautomator:uiautomator:2.4.0-beta02")
 }

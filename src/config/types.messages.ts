@@ -58,6 +58,7 @@ export type StatusReactionsEmojiConfig = {
   error?: string;
   stallSoft?: string;
   stallHard?: string;
+  compacting?: string;
 };
 
 export type StatusReactionsTimingConfig = {
@@ -141,12 +142,18 @@ export type CommandsConfig = {
   nativeSkills?: NativeCommandsSetting;
   /** Enable text command parsing (default: true). */
   text?: boolean;
+  /** Allow model-management write commands like `/models add` (default: true). */
+  modelsWrite?: boolean;
   /** Allow bash chat command (`!`; `/bash` alias) (default: false). */
   bash?: boolean;
   /** How long bash waits before backgrounding (default: 2000; 0 backgrounds immediately). */
   bashForegroundMs?: number;
   /** Allow /config command (default: false). */
   config?: boolean;
+  /** Allow /mcp command for OpenClaw-managed MCP settings (default: false). */
+  mcp?: boolean;
+  /** Allow /plugins command for plugin listing and enablement toggles (default: false). */
+  plugins?: boolean;
   /** Allow /debug command (default: false). */
   debug?: boolean;
   /** Allow restart commands/tools (default: true). */
